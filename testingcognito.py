@@ -1,28 +1,46 @@
 from flask import Flask, redirect, url_for, render_template_string, request, session
-import warrant
 import boto3
 from botocore.exceptions import ClientError
 import secrets
+from onelogin.saml2.auth import OneLogin_Saml2_Auth
+from onelogin.saml2.settings import OneLogin_Saml2_Settings
+from onelogin.saml2.utils import OneLogin_Saml2_Utils
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)  # Generate a secure secret key
 
-# Cognito configuration (replace with your actual values)
+# Cognito configuration 
 USER_POOL_ID = 'your_cognito_user_pool_id'
 APP_CLIENT_ID = 'your_cognito_app_client_id'
-IDENTITY_POOL_ID = 'your_cognito_identity_pool_id'   
-
+IDENTITY_POOL_ID = 'your_cognito_identity_pool_id'
 REGION = 'your_aws_region'
 
-# SAML configuration (replace with your actual SAML provider details)
-SAML_PROVIDER_NAME = 'your_saml_provider_name'
-SAML_METADATA_URL = 'your_saml_metadata_url'
+# SAML configuration 
+SAML_SETTINGS = {
+    'sp': {
+        'entityId': 'your-sp-entity-id', 
+        'assertionConsumerService': {
+            'url': 'http://localhost:5000/saml_callback', 
+            'binding': 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST',
+        },
+        'privateKey': 'your-sp-private-key',
+        'x509cert': 'your-sp-certificate',
+    },
+    'idp': {
+        'entityId': 'your-idp-entity-id', 
+        'singleSignOnService': {
+            'url': 'your-idp-sso-url', 
+            'binding': 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect',
+        },
+        'x509cert': 'your-idp-certificate', 
+    },
+}
 
 # Initialize Cognito clients
 cognito_idp = boto3.client('cognito-idp', region_name=REGION)
 cognito_identity = boto3.client('cognito-identity', region_name=REGION)
 
-# login.html template (embedded within the script)
+# login.html template
 login_html = '''
 <!DOCTYPE html>
 <html>
@@ -44,13 +62,11 @@ login_html = '''
             <label for="username">Username:</label>
             <input type="text" id="username" name="username" required><br><br>
 
-            <label for="password">Password:</label>   
-
+            <label for="password">Password:</label>
             <input type="password" id="password" name="password" required><br><br>
 
             <input type="submit" value="Login">
-        </form>   
-
+        </form>
 
         <br>
 
@@ -61,6 +77,24 @@ login_html = '''
 </body>
 </html>
 '''
+
+
+def init_saml_auth(req):
+    auth = OneLogin_Saml2_Auth(req, SAML_SETTINGS)
+    return auth
+
+
+def prepare_flask_request(request):
+    # If server is behind proxys or balancers use the HTTP_X_FORWARDED fields
+    url_data = urlparse(request.url)
+    return {
+        'https': 'on' if request.scheme == 'https' else 'off',
+        'http_host': request.host,
+        'server_port': url_data.port,
+        'script_name': request.path,
+        'get_data': request.args.copy(),
+        'post_data': request.form.copy()
+    }
 
 
 @app.route('/')
@@ -75,11 +109,9 @@ def index():
 def login():
     if request.method == 'POST':
         username = request.form['username']
-        password = request.form['password']   
-
+        password = request.form['password']
 
         try:
-            # Regular Cognito sign-in
             response = cognito_idp.initiate_auth(
                 AuthFlow='USER_PASSWORD_AUTH',
                 AuthParameters={
@@ -89,7 +121,6 @@ def login():
                 ClientId=APP_CLIENT_ID
             )
 
-            # Store tokens in session
             session['access_token'] = response['AuthenticationResult']['AccessToken']
             session['id_token'] = response['AuthenticationResult']['IdToken']
             session['refresh_token'] = response['AuthenticationResult']['RefreshToken']
@@ -105,74 +136,71 @@ def login():
 
 @app.route('/saml_login')
 def saml_login():
-    # SAML login initiation
-    aws_cognito_domain = f"cognito-idp.{REGION}.amazonaws.com/{USER_POOL_ID}"
-    provider = warrant.SAMLIdP(
-        idp_name=SAML_PROVIDER_NAME,
-        metadata_url=SAML_METADATA_URL,
-        aws_cognito_region=REGION,
-        user_pool_id=USER_POOL_ID,
-        cognito_idp=cognito_idp
-    )
-
-    login_url, _ = provider.get_signin_url(
-        relay_state=request.url_root  # Redirect back to the app after login
-    )
-    return redirect(login_url)
+    req = prepare_flask_request(request)
+    auth = init_saml_auth(req)
+    return redirect(auth.login())
 
 
 @app.route('/saml_callback')
 def saml_callback():
-    # SAML callback handling
-    provider = warrant.SAMLIdP(
-        idp_name=SAML_PROVIDER_NAME,
-        metadata_url=SAML_METADATA_URL,
-        aws_cognito_region=REGION,
-        user_pool_id=USER_POOL_ID,
-        cognito_idp=cognito_idp
-    )
+    req = prepare_flask_request(request)
+    auth = init_saml_auth(req)
+    auth.process_response()
+    errors = auth.get_errors()
 
+    if errors:
+        return render_template_string(login_html, error=', '.join(errors))
+
+    aws_cognito_domain = f"cognito-idp.{REGION}.amazonaws.com/{USER_POOL_ID}"
+
+    # Retrieve SAML assertion and attributes (if needed)
+    assertion = auth.get_last_assertion()
+    attributes = auth.get_attributes()
+
+    # Exchange SAML assertion for Cognito tokens
     try:
-        # Parse SAML response and get Cognito tokens
-        tokens = provider.process_response(
-            http_response=request.form,  # Use 'request.form' for POST data
-            aws_cognito_domain=f"cognito-idp.{REGION}.amazonaws.com/{USER_POOL_ID}"
+        response = cognito_idp.admin_initiate_auth(
+            UserPoolId=USER_POOL_ID,
+            ClientId=APP_CLIENT_ID,
+            AuthFlow='ADMIN_USER_PASSWORD_AUTH',
+            AuthParameters={
+                'USERNAME': attributes['http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress'][0],
+                'PASSWORD': assertion  # Use the SAML assertion as the password
+            }
         )
 
-        # Get identity ID from Cognito
+        # Store tokens in session
+        session['access_token'] = response['AuthenticationResult']['AccessToken']
+        session['id_token'] = response['AuthenticationResult']['IdToken']
+        session['refresh_token'] = response['AuthenticationResult']['RefreshToken']
+
+        # (Optional) Get AWS credentials using Cognito Identity
         identity_id = cognito_identity.get_id(
-            AccountId='your_aws_account_id',  # Replace with your AWS account ID
+            AccountId='your_aws_account_id',
             IdentityPoolId=IDENTITY_POOL_ID,
             Logins={
-                aws_cognito_domain: tokens['AuthenticationResult']['IdToken']
+                aws_cognito_domain: session['id_token']
             }
         )['IdentityId']
 
-        # Get credentials for the identity (if needed)
         credentials = cognito_identity.get_credentials_for_identity(
             IdentityId=identity_id,
             Logins={
-                aws_cognito_domain: tokens['AuthenticationResult']['IdToken']
+                aws_cognito_domain: session['id_token']
             }
         )['Credentials']
 
-        # Store tokens and credentials in session (optional)
-        session['access_token'] = tokens['AuthenticationResult']['AccessToken']
-        session['id_token'] = tokens['AuthenticationResult']['IdToken']
-        session['refresh_token'] = tokens['AuthenticationResult']['RefreshToken']
         # ... store credentials as needed ...
 
-        return redirect(url_for('index'))
-
-    except warrant.WarrantError as e:
-        # Handle SAML errors gracefully
-        error_message = str(e) 
+    except ClientError as e:
+        error_message = e.response['Error']['Message']
         return render_template_string(login_html, error=error_message)
+
+    return redirect(url_for('index'))
 
 
 @app.route('/logout')
 def logout():
-    # Clear session data
     session.clear()
     return redirect(url_for('index'))
 
